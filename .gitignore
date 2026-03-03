@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+out/
+
+# python
+backend/venv/
+backend/__pycache__/
+
+# env files
+.env
+backend/.env
+
+# os
+.DS_Store
+
+# build
+*.tsbuildinfo

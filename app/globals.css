@@ -1,0 +1,26 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@layer utilities {
+  .bg-gradient-hero {
+    background: linear-gradient(135deg, #4f46e5 0%, #6366f1 40%, #3b82f6 100%);
+  }
+  .bg-gradient-body {
+    background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+  }
+  .text-gradient-brand {
+    background: linear-gradient(135deg, #4f46e5, #3b82f6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+}
