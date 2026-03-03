@@ -24,21 +24,6 @@ function bufferToBase64url(buffer: ArrayBuffer): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-// ── LocalStorage keys ──
-
-const LS_USER_HANDLE = "paysecure_user_handle";
-const LS_REGISTERED = "paysecure_webauthn_registered";
-
-function getUserHandle(): string {
-  if (typeof window === "undefined") return "";
-  let handle = localStorage.getItem(LS_USER_HANDLE);
-  if (!handle) {
-    handle = crypto.randomUUID();
-    localStorage.setItem(LS_USER_HANDLE, handle);
-  }
-  return handle;
-}
-
 // ── Hook ──
 
 export interface UseWebAuthnReturn {
@@ -50,42 +35,55 @@ export interface UseWebAuthnReturn {
   error: string | null;
 }
 
-export function useWebAuthn(): UseWebAuthnReturn {
+export function useWebAuthn(
+  userId: string | null,
+  accessToken: string | null
+): UseWebAuthnReturn {
   const [isSupported, setIsSupported] = useState(false);
   const [isRegistered, setIsRegistered] = useState(false);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const lsKey = userId ? `paysecure_webauthn_registered_${userId}` : null;
+
   useEffect(() => {
+    if (!userId) return;
     const check = async () => {
       if (
         typeof window !== "undefined" &&
         window.PublicKeyCredential !== undefined &&
         typeof navigator.credentials?.create === "function"
       ) {
-        // Works with Touch ID, Face ID, Windows Hello, or browser-managed passkeys
         setIsSupported(true);
       }
-      setIsRegistered(localStorage.getItem(LS_REGISTERED) === "true");
+      if (lsKey) {
+        setIsRegistered(localStorage.getItem(lsKey) === "true");
+      }
     };
     check();
-  }, []);
+  }, [userId, lsKey]);
+
+  const authHeaders = useCallback(
+    () => ({
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    }),
+    [accessToken]
+  );
 
   const register = useCallback(async (): Promise<boolean> => {
+    if (!userId || !accessToken) return false;
     setError(null);
-    const userHandle = getUserHandle();
 
     try {
-      // 1. Get registration options from backend
       const optionsRes = await fetch(`${BACKEND}/api/webauthn/register/options`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_handle: userHandle }),
+        headers: authHeaders(),
+        body: JSON.stringify({ user_handle: userId }),
       });
       if (!optionsRes.ok) throw new Error("Failed to get registration options");
       const options = await optionsRes.json();
 
-      // 2. Convert base64url fields to ArrayBuffers
       const publicKey: PublicKeyCredentialCreationOptions = {
         ...options,
         challenge: base64urlToBuffer(options.challenge),
@@ -101,7 +99,6 @@ export function useWebAuthn(): UseWebAuthnReturn {
         ),
       };
 
-      // 3. Create credential (triggers biometric prompt)
       const credential = (await navigator.credentials.create({
         publicKey,
       })) as PublicKeyCredential | null;
@@ -110,12 +107,11 @@ export function useWebAuthn(): UseWebAuthnReturn {
 
       const response = credential.response as AuthenticatorAttestationResponse;
 
-      // 4. Serialize and send to backend for verification
       const verifyRes = await fetch(`${BACKEND}/api/webauthn/register/verify`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({
-          user_handle: userHandle,
+          user_handle: userId,
           credential: {
             id: credential.id,
             rawId: bufferToBase64url(credential.rawId),
@@ -133,7 +129,9 @@ export function useWebAuthn(): UseWebAuthnReturn {
         throw new Error(err?.detail || "Registration verification failed");
       }
 
-      localStorage.setItem(LS_REGISTERED, "true");
+      if (lsKey) {
+        localStorage.setItem(lsKey, "true");
+      }
       setIsRegistered(true);
       return true;
     } catch (err) {
@@ -146,27 +144,25 @@ export function useWebAuthn(): UseWebAuthnReturn {
       setError(msg);
       return false;
     }
-  }, []);
+  }, [userId, accessToken, lsKey, authHeaders]);
 
   const authenticate = useCallback(async (): Promise<boolean> => {
+    if (!userId || !accessToken) return false;
     setError(null);
     setIsAuthenticating(true);
-    const userHandle = getUserHandle();
 
     try {
-      // 1. Get authentication options from backend
       const optionsRes = await fetch(
         `${BACKEND}/api/webauthn/authenticate/options`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_handle: userHandle }),
+          headers: authHeaders(),
+          body: JSON.stringify({ user_handle: userId }),
         }
       );
       if (!optionsRes.ok) throw new Error("Failed to get authentication options");
       const options = await optionsRes.json();
 
-      // 2. Convert base64url fields to ArrayBuffers
       const publicKey: PublicKeyCredentialRequestOptions = {
         ...options,
         challenge: base64urlToBuffer(options.challenge),
@@ -178,7 +174,6 @@ export function useWebAuthn(): UseWebAuthnReturn {
         ),
       };
 
-      // 3. Get credential (triggers biometric prompt)
       const credential = (await navigator.credentials.get({
         publicKey,
       })) as PublicKeyCredential | null;
@@ -187,14 +182,13 @@ export function useWebAuthn(): UseWebAuthnReturn {
 
       const response = credential.response as AuthenticatorAssertionResponse;
 
-      // 4. Serialize and send to backend for verification
       const verifyRes = await fetch(
         `${BACKEND}/api/webauthn/authenticate/verify`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders(),
           body: JSON.stringify({
-            user_handle: userHandle,
+            user_handle: userId,
             credential: {
               id: credential.id,
               rawId: bufferToBase64url(credential.rawId),
@@ -230,7 +224,7 @@ export function useWebAuthn(): UseWebAuthnReturn {
     } finally {
       setIsAuthenticating(false);
     }
-  }, []);
+  }, [userId, accessToken, authHeaders]);
 
   return { isSupported, isRegistered, isAuthenticating, register, authenticate, error };
 }

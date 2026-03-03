@@ -1,10 +1,11 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Html5Qrcode } from "html5-qrcode";
 import { useAudioRecorder } from "./useAudioRecorder";
 import { useWebAuthn } from "./useWebAuthn";
+import { useAuth } from "../components/AuthProvider";
 
 type ScanState =
   | "idle"
@@ -13,7 +14,9 @@ type ScanState =
   | "recording"
   | "transcribing"
   | "extracting"
-  | "payment-ready";
+  | "payment-ready"
+  | "paying"
+  | "wallet-success";
 
 type TrustStatus = "checking" | "verified" | "blacklisted" | "unknown";
 
@@ -29,6 +32,11 @@ interface VoiceResult {
   currency: string;
 }
 
+interface WalletSuccessData {
+  newBalance: number;
+  amount: number;
+  merchant: string;
+}
 
 /* ── Icons ── */
 
@@ -243,10 +251,31 @@ export default function ScanPage() {
   const [preview, setPreview] = useState<string | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
   const [voiceResult, setVoiceResult] = useState<VoiceResult | null>(null);
+  const [walletBalance, setWalletBalance] = useState<number | null>(null);
+  const [walletSuccess, setWalletSuccess] = useState<WalletSuccessData | null>(null);
 
+  const { user, session } = useAuth();
   const recorder = useAudioRecorder();
-  const webauthn = useWebAuthn();
+  const webauthn = useWebAuthn(user?.id ?? null, session?.access_token ?? null);
   const [highAmountAcknowledged, setHighAmountAcknowledged] = useState(false);
+  const [biometricVerified, setBiometricVerified] = useState(false);
+
+  // Fetch wallet balance on mount
+  useEffect(() => {
+    const fetchBalance = async () => {
+      if (!session?.access_token) return;
+      try {
+        const res = await fetch(`${BACKEND}/api/wallet/balance`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setWalletBalance(data.balance);
+        }
+      } catch { /* ignore */ }
+    };
+    fetchBalance();
+  }, [session]);
 
   // ── Trust verification ──
 
@@ -271,7 +300,6 @@ export default function ScanPage() {
     setError(null);
     setState("processing");
 
-    // Show preview
     const dataUrl = await new Promise<string>((resolve) => {
       const r = new FileReader();
       r.onload = (e) => resolve(e.target?.result as string);
@@ -280,7 +308,6 @@ export default function ScanPage() {
     setPreview(dataUrl);
 
     try {
-      // html5-qrcode needs a div element to mount on
       const tempDiv = document.createElement("div");
       tempDiv.id = "html5-qr-temp-" + Date.now();
       tempDiv.style.display = "none";
@@ -288,9 +315,9 @@ export default function ScanPage() {
 
       let qrData: string | null = null;
       try {
-        const scanner = new Html5Qrcode(tempDiv.id, /* verbose */ false);
-        const result = await scanner.scanFileV2(file, /* showImage */ false);
-        qrData = result.decodedText;
+        const scanner = new Html5Qrcode(tempDiv.id, false);
+        const qrResult = await scanner.scanFileV2(file, false);
+        qrData = qrResult.decodedText;
         scanner.clear();
       } catch {
         // scan failed
@@ -351,6 +378,7 @@ export default function ScanPage() {
     setPreview(null);
     setHighAmountAcknowledged(false);
     setBiometricVerified(false);
+    setWalletSuccess(null);
     recorder.reset();
     setState("idle");
   };
@@ -425,19 +453,68 @@ export default function ScanPage() {
     if (state === "recording") setState("result");
   }
 
-  const [biometricVerified, setBiometricVerified] = useState(false);
+  // ── Wallet payment ──
+
+  const handleWalletPayment = async () => {
+    if (!result || !voiceResult || !session?.access_token) return;
+    setState("paying");
+
+    try {
+      const res = await fetch(`${BACKEND}/api/wallet/pay`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          amount: voiceResult.amount,
+          upi_id: result.upi_id,
+          merchant_name: result.merchant_name,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.detail || "Payment failed");
+      }
+
+      const { new_balance } = await res.json();
+      setWalletBalance(new_balance);
+      setWalletSuccess({
+        newBalance: new_balance,
+        amount: voiceResult.amount,
+        merchant: result.merchant_name,
+      });
+      setState("wallet-success");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Payment failed");
+      setState("payment-ready");
+      setBiometricVerified(false);
+    }
+  };
+
+  // ── Confirm payment ──
 
   const handleConfirmPayment = async () => {
     if (!result || !voiceResult || isBlacklisted) return;
 
+    // Step 1: Biometric check
     if (webauthn.isSupported && webauthn.isRegistered) {
       const success = await webauthn.authenticate();
       if (!success) return;
-      setBiometricVerified(true);
-      return;
     }
 
-    setBiometricVerified(true);
+    // Step 2: Decide wallet vs UPI
+    const canUseWallet =
+      !isHighAmount &&
+      walletBalance !== null &&
+      walletBalance >= voiceResult.amount;
+
+    if (canUseWallet) {
+      await handleWalletPayment();
+    } else {
+      setBiometricVerified(true);
+    }
   };
 
   const isBlacklisted = result?.trust_status === "blacklisted";
@@ -448,6 +525,13 @@ export default function ScanPage() {
     result && voiceResult
       ? `pa=${encodeURIComponent(result.upi_id)}&pn=${encodeURIComponent(result.merchant_name)}&am=${voiceResult.amount}&cu=${voiceResult.currency}`
       : "";
+
+  // Can we use wallet for this payment?
+  const canPayWithWallet =
+    voiceResult &&
+    !isHighAmount &&
+    walletBalance !== null &&
+    walletBalance >= voiceResult.amount;
 
   return (
     <main className="flex min-h-screen flex-col bg-gray-50/50">
@@ -641,6 +725,16 @@ export default function ScanPage() {
               </div>
             )}
 
+            {/* Wallet balance indicator */}
+            {walletBalance !== null && (
+              <div className="w-full rounded-xl bg-brand-50 border border-brand-100 px-4 py-2.5 flex items-center justify-between">
+                <span className="text-xs font-semibold text-brand-700">Wallet Balance</span>
+                <span className="text-sm font-bold text-brand-700">
+                  ₹{walletBalance.toLocaleString("en-IN")}
+                </span>
+              </div>
+            )}
+
             {/* Payment summary card */}
             <div className="w-full rounded-2xl bg-white border border-gray-100 shadow-card p-6 space-y-0 animate-fadeIn">
               <div className="pb-4 border-b border-gray-100">
@@ -682,6 +776,29 @@ export default function ScanPage() {
               </div>
             </div>
 
+            {/* Payment method indicator */}
+            {!isBlacklisted && (
+              <div className={`w-full rounded-xl px-4 py-2.5 flex items-center gap-2 ${
+                canPayWithWallet
+                  ? "bg-emerald-50 border border-emerald-100"
+                  : "bg-amber-50 border border-amber-100"
+              }`}>
+                <svg className={`h-4 w-4 ${canPayWithWallet ? "text-emerald-500" : "text-amber-500"}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d={canPayWithWallet
+                    ? "M21 12a2.25 2.25 0 00-2.25-2.25H15a3 3 0 11-6 0H5.25A2.25 2.25 0 003 12m18 0v6a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 18v-6m18 0V9M3 12V9m18 0a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 9m18 0V6a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 6v3"
+                    : "M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
+                  } />
+                </svg>
+                <span className={`text-xs font-bold ${canPayWithWallet ? "text-emerald-700" : "text-amber-700"}`}>
+                  {canPayWithWallet
+                    ? "Payment via PaySecure Wallet"
+                    : isHighAmount
+                      ? "High amount — will redirect to UPI app"
+                      : "Insufficient wallet balance — will redirect to UPI app"}
+                </span>
+              </div>
+            )}
+
             {isBlacklisted && (
               <div className="w-full rounded-xl bg-red-100 border border-red-300 px-4 py-3 text-center flex items-center justify-center gap-2">
                 <svg className="h-5 w-5 text-red-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -709,6 +826,15 @@ export default function ScanPage() {
                 >
                   I Understand
                 </button>
+              </div>
+            )}
+
+            {error && (
+              <div className="w-full rounded-xl bg-red-50 border border-red-200 px-4 py-3 flex items-start gap-3">
+                <svg className="h-5 w-5 text-red-500 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+                </svg>
+                <p className="text-sm text-red-700">{error}</p>
               </div>
             )}
 
@@ -767,6 +893,51 @@ export default function ScanPage() {
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* ── PAYING (wallet debit in progress) ── */}
+        {state === "paying" && result && (
+          <div className="flex flex-col items-center gap-6 w-full animate-fadeIn">
+            <MerchantCard result={result} compact />
+            <div className="flex flex-col items-center gap-3">
+              <Spinner className="h-10 w-10 text-brand-500" />
+              <p className="text-sm font-semibold text-gray-700">Processing payment<AnimatedDots /></p>
+            </div>
+          </div>
+        )}
+
+        {/* ── WALLET SUCCESS ── */}
+        {state === "wallet-success" && walletSuccess && (
+          <div className="flex flex-col items-center gap-5 w-full animate-fadeIn">
+            <div className="flex h-20 w-20 items-center justify-center rounded-full bg-emerald-100">
+              <svg className="h-10 w-10 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+              </svg>
+            </div>
+            <div className="w-full rounded-2xl bg-white border border-gray-100 shadow-card p-6 text-center">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-600 mb-1">
+                Payment Successful
+              </p>
+              <p className="text-4xl font-extrabold text-gray-900 mt-2">
+                ₹{walletSuccess.amount.toLocaleString("en-IN")}
+              </p>
+              <p className="text-sm text-gray-500 mt-2">
+                Paid to <span className="font-semibold text-gray-700">{walletSuccess.merchant}</span>
+              </p>
+              <div className="mt-4 pt-4 border-t border-gray-100">
+                <p className="text-xs text-gray-400">Remaining wallet balance</p>
+                <p className="text-xl font-bold text-brand-600">
+                  ₹{walletSuccess.newBalance.toLocaleString("en-IN")}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={handleReset}
+              className="w-full rounded-full bg-gradient-to-r from-brand-600 to-brand-500 px-10 py-4 text-lg font-bold text-white shadow-card-lg active:scale-95 transition-all"
+            >
+              Done
+            </button>
           </div>
         )}
       </div>

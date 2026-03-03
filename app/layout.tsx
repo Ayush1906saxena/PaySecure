@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import { createClient } from "@/lib/supabase/server";
+import { AuthProvider } from "./components/AuthProvider";
 
 export const metadata: Metadata = {
   title: "PaySecure",
@@ -34,18 +36,23 @@ function ServiceWorkerRegistration() {
   );
 }
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const supabase = await createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+
   return (
     <html lang="en">
       <head>
         <link rel="apple-touch-icon" href="/icon-192x192.png" />
       </head>
       <body className="bg-gradient-body min-h-screen antialiased font-sans">
-        {children}
+        <AuthProvider initialSession={session}>{children}</AuthProvider>
         <ServiceWorkerRegistration />
       </body>
     </html>

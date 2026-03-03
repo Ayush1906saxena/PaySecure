@@ -11,7 +11,11 @@ backend/__pycache__/
 
 # env files
 .env
+.env.local
 backend/.env
+
+# claude
+.claude/
 
 # os
 .DS_Store

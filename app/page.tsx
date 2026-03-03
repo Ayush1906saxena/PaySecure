@@ -1,8 +1,38 @@
 import Link from "next/link";
+import { createClient } from "@/lib/supabase/server";
+import { redirect } from "next/navigation";
+import SignOutButton from "./components/SignOutButton";
+import WalletBanner from "./components/WalletBanner";
 
-export default function Home() {
+export default async function Home() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) redirect("/login");
+
   return (
     <main className="flex min-h-screen flex-col">
+      {/* User bar */}
+      <div className="bg-white/80 backdrop-blur-md border-b border-gray-100 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+        <span className="text-sm font-semibold text-gray-700 truncate max-w-[200px]">
+          {user.email}
+        </span>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/history"
+            className="text-sm font-semibold text-brand-600 hover:text-brand-700 transition-colors"
+          >
+            History
+          </Link>
+          <SignOutButton />
+        </div>
+      </div>
+
+      {/* Wallet balance */}
+      <WalletBanner />
+
       {/* Hero section */}
       <div className="bg-gradient-hero flex flex-1 flex-col items-center justify-center px-8 py-16 text-center relative overflow-hidden">
         {/* Subtle background circles */}
@@ -49,7 +79,7 @@ export default function Home() {
           {[
             { label: "QR Scan", icon: "M3.75 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5A1.125 1.125 0 013.75 9.375v-4.5z" },
             { label: "Voice Pay", icon: "M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" },
-            { label: "Biometric", icon: "M7.864 4.243A7.5 7.5 0 0119.5 10.5c0 2.92-.556 5.709-1.568 8.268M5.742 6.364A7.465 7.465 0 004.5 10.5a7.464 7.464 0 01-1.15 3.993m1.989 3.559A11.209 11.209 0 008.25 10.5a3.75 3.75 0 117.5 0c0 .527-.021 1.049-.064 1.565M12 10.5a14.94 14.94 0 01-3.6 9.75m6.633-4.596a18.666 18.666 0 01-2.485 5.33" },
+            { label: "Wallet", icon: "M21 12a2.25 2.25 0 00-2.25-2.25H15a3 3 0 11-6 0H5.25A2.25 2.25 0 003 12m18 0v6a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 18v-6m18 0V9M3 12V9m18 0a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 9m18 0V6a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 6v3" },
             { label: "Trust Check", icon: "M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" },
           ].map((f) => (
             <span

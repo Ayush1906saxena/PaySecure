@@ -11,7 +11,9 @@ import cv2
 import numpy as np
 import speech_recognition as sr
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import jwt as pyjwt
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from PIL import Image, ImageEnhance, ImageFilter
@@ -56,6 +58,47 @@ if supabase:
     print("[INFO] Supabase client initialized.")
 else:
     print("[WARN] Supabase credentials missing — trust engine disabled.")
+
+# ── Service role Supabase client (for wallet operations) ──
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+try:
+    supabase_admin = create_client(
+        SUPABASE_URL,
+        SUPABASE_SERVICE_ROLE_KEY,
+        options=ClientOptions(postgrest_client_timeout=5),
+    ) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else None
+except Exception as e:
+    print(f"[WARN] Supabase admin client init failed: {e}")
+    supabase_admin = None
+
+if supabase_admin:
+    print("[INFO] Supabase admin client initialized (wallet enabled).")
+else:
+    print("[WARN] Service role key missing — wallet disabled.")
+
+# ── JWT Validation ──
+bearer_scheme = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> dict:
+    """Validate Supabase JWT and return decoded claims."""
+    token = credentials.credentials
+    try:
+        payload = pyjwt.decode(
+            token,
+            options={"verify_signature": False},
+            algorithms=["HS256"],
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token: no sub claim")
+        return {"user_id": user_id, "payload": payload}
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 # ── In-memory trust cache (upi_id → (status, timestamp)) ──
 _trust_cache: dict[str, tuple[str, float]] = {}
@@ -501,6 +544,154 @@ async def verify_merchant(req: VerifyRequest):
     return VerifyResponse(status=status)
 
 
+# ── Wallet Endpoints ──
+
+
+class WalletBalanceResponse(BaseModel):
+    balance: float
+
+
+class TopUpRequest(BaseModel):
+    amount: float
+
+
+class TopUpResponse(BaseModel):
+    success: bool
+    new_balance: float
+
+
+class PayRequest(BaseModel):
+    amount: float
+    upi_id: str
+    merchant_name: str
+
+
+class PayResponse(BaseModel):
+    success: bool
+    new_balance: float
+    transaction_id: str
+
+
+@app.get("/api/wallet/balance", response_model=WalletBalanceResponse)
+async def get_wallet_balance(current_user: dict = Depends(get_current_user)):
+    """Return wallet balance for the authenticated user."""
+    if not supabase_admin:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = current_user["user_id"]
+
+    try:
+        result = (
+            supabase_admin.table("wallets")
+            .select("balance")
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+        return WalletBalanceResponse(balance=float(result.data["balance"]))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Wallet balance fetch failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch wallet balance")
+
+
+@app.post("/api/wallet/topup", response_model=TopUpResponse)
+async def wallet_topup(
+    req: TopUpRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Add money to wallet (simulated top-up for demo)."""
+    if not supabase_admin:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = current_user["user_id"]
+
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    if req.amount > 100000:
+        raise HTTPException(status_code=400, detail="Maximum top-up is ₹1,00,000")
+
+    try:
+        result = supabase_admin.rpc(
+            "credit_wallet",
+            {"p_user_id": user_id, "p_amount": req.amount},
+        ).execute()
+
+        if result.data is None:
+            raise HTTPException(status_code=400, detail="Top-up failed")
+
+        new_balance = float(result.data)
+        print(f"[INFO] Wallet top-up: user={user_id[:8]} amount={req.amount} new_balance={new_balance}")
+        return TopUpResponse(success=True, new_balance=new_balance)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Wallet top-up failed: {e}")
+        raise HTTPException(status_code=500, detail="Top-up failed")
+
+
+@app.post("/api/wallet/pay", response_model=PayResponse)
+async def wallet_pay(
+    req: PayRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Atomically debit user wallet and record transaction."""
+    if not supabase_admin:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = current_user["user_id"]
+
+    if req.amount > 5000:
+        raise HTTPException(
+            status_code=400,
+            detail="Amounts above ₹5,000 must use a UPI app",
+        )
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+
+    try:
+        result = supabase_admin.rpc(
+            "debit_wallet",
+            {
+                "p_user_id": user_id,
+                "p_amount": req.amount,
+                "p_upi_id": req.upi_id,
+                "p_merchant_name": req.merchant_name,
+            },
+        ).execute()
+
+        if result.data is None:
+            raise HTTPException(status_code=400, detail="Debit failed")
+
+        new_balance = float(result.data)
+
+        tx_result = (
+            supabase_admin.table("transactions")
+            .select("id")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        tx_id = tx_result.data[0]["id"] if tx_result.data else "unknown"
+
+        print(f"[INFO] Wallet debit: user={user_id[:8]} amount={req.amount} new_balance={new_balance}")
+        return PayResponse(success=True, new_balance=new_balance, transaction_id=tx_id)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        if "Insufficient balance" in error_msg:
+            raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+        print(f"[ERROR] Wallet debit failed: {e}")
+        raise HTTPException(status_code=500, detail="Payment failed")
+
+
 # ── WebAuthn Biometric Endpoints ──
 
 
@@ -583,8 +774,13 @@ def _update_sign_count(credential_id: bytes, new_sign_count: int):
 
 
 @app.post("/api/webauthn/register/options")
-async def webauthn_register_options(req: WebAuthnUserRequest):
+async def webauthn_register_options(
+    req: WebAuthnUserRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """Generate registration challenge and options."""
+    if req.user_handle != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="user_handle must match authenticated user")
     existing_creds = _get_credentials(req.user_handle)
     exclude_credentials = [
         PublicKeyCredentialDescriptor(id=c["credential_id"])
@@ -611,8 +807,13 @@ async def webauthn_register_options(req: WebAuthnUserRequest):
 
 
 @app.post("/api/webauthn/register/verify")
-async def webauthn_register_verify(req: WebAuthnRegisterVerifyRequest):
+async def webauthn_register_verify(
+    req: WebAuthnRegisterVerifyRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """Verify registration attestation and store credential in Supabase."""
+    if req.user_handle != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="user_handle must match authenticated user")
     challenge = _webauthn_challenges.pop(req.user_handle, None)
     if not challenge:
         raise HTTPException(status_code=400, detail="No pending registration challenge")
@@ -650,8 +851,13 @@ async def webauthn_register_verify(req: WebAuthnRegisterVerifyRequest):
 
 
 @app.post("/api/webauthn/authenticate/options")
-async def webauthn_authenticate_options(req: WebAuthnUserRequest):
+async def webauthn_authenticate_options(
+    req: WebAuthnUserRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """Generate authentication challenge and options."""
+    if req.user_handle != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="user_handle must match authenticated user")
     creds = _get_credentials(req.user_handle)
     if not creds:
         raise HTTPException(status_code=404, detail="No registered credentials")
@@ -674,8 +880,13 @@ async def webauthn_authenticate_options(req: WebAuthnUserRequest):
 
 
 @app.post("/api/webauthn/authenticate/verify")
-async def webauthn_authenticate_verify(req: WebAuthnAuthVerifyRequest):
+async def webauthn_authenticate_verify(
+    req: WebAuthnAuthVerifyRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """Verify authentication assertion."""
+    if req.user_handle != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="user_handle must match authenticated user")
     challenge = _webauthn_challenges.pop(req.user_handle, None)
     if not challenge:
         raise HTTPException(status_code=400, detail="No pending authentication challenge")
