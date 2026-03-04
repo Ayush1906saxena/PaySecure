@@ -500,6 +500,23 @@ async def extract_amount(req: ExtractRequest):
 # ── Trust Engine ──
 
 
+class ReportRequest(BaseModel):
+    transaction_id: str
+    upi_id: str
+    reason: str
+
+
+class ReportResponse(BaseModel):
+    success: bool
+    weight: float
+    total_score: float
+    blacklisted: bool
+
+
+class ReportStatusResponse(BaseModel):
+    already_reported: bool
+
+
 class VerifyRequest(BaseModel):
     upi_id: str
 
@@ -542,6 +559,93 @@ async def verify_merchant(req: VerifyRequest):
     print(f"[DEBUG] Trust cache MISS: {upi_id} → {status} (cached)")
 
     return VerifyResponse(status=status)
+
+
+# ── Merchant Reporting ──
+
+VALID_REPORT_REASONS = {"Scam", "Wrong Amount", "Fake Merchant", "Other"}
+
+
+@app.post("/api/merchant/report", response_model=ReportResponse)
+async def report_merchant(
+    req: ReportRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Submit a weighted merchant report. Requires a valid transaction."""
+    if not supabase_admin:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    if req.reason not in VALID_REPORT_REASONS:
+        raise HTTPException(status_code=400, detail=f"Invalid reason. Must be one of: {', '.join(VALID_REPORT_REASONS)}")
+
+    user_id = current_user["user_id"]
+    upi_id = req.upi_id.strip().lower()
+
+    try:
+        result = supabase_admin.rpc(
+            "submit_merchant_report",
+            {
+                "p_user_id": user_id,
+                "p_transaction_id": req.transaction_id,
+                "p_upi_id": upi_id,
+                "p_reason": req.reason,
+            },
+        ).execute()
+
+        if result.data is None:
+            raise HTTPException(status_code=400, detail="Report submission failed")
+
+        data = result.data
+        # Invalidate trust cache for this UPI ID so next verify picks up new status
+        _trust_cache.pop(upi_id, None)
+
+        print(f"[INFO] Merchant report: user={user_id[:8]} upi={upi_id} weight={data['weight']} total={data['total_score']} blacklisted={data['blacklisted']}")
+        return ReportResponse(
+            success=True,
+            weight=float(data["weight"]),
+            total_score=float(data["total_score"]),
+            blacklisted=bool(data["blacklisted"]),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        if "already reported" in error_msg.lower():
+            raise HTTPException(status_code=409, detail="You have already reported this merchant")
+        if "cooldown" in error_msg.lower():
+            raise HTTPException(status_code=429, detail="Please wait before reporting another merchant (1 hour cooldown)")
+        if "transaction" in error_msg.lower() and "not found" in error_msg.lower():
+            raise HTTPException(status_code=400, detail="Invalid transaction — you can only report merchants you paid")
+        print(f"[ERROR] Merchant report failed: {e}")
+        raise HTTPException(status_code=500, detail="Report submission failed")
+
+
+@app.get("/api/merchant/report-status", response_model=ReportStatusResponse)
+async def report_status(
+    upi_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Check if the current user has already reported a merchant."""
+    if not supabase_admin:
+        return ReportStatusResponse(already_reported=False)
+
+    user_id = current_user["user_id"]
+    clean_upi = upi_id.strip().lower()
+
+    try:
+        result = (
+            supabase_admin.table("merchant_reports")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("upi_id", clean_upi)
+            .limit(1)
+            .execute()
+        )
+        return ReportStatusResponse(already_reported=bool(result.data))
+    except Exception as e:
+        print(f"[ERROR] Report status check failed: {e}")
+        return ReportStatusResponse(already_reported=False)
 
 
 # ── Wallet Endpoints ──

@@ -9,6 +9,7 @@ Secure UPI payment app with QR scanning, voice commands, in-app wallet, biometri
 - **QR Code Scanning** — Scan UPI QR codes using your device camera. Uses html5-qrcode on the client with OpenCV + pyzbar + LLM fallback on the backend.
 - **Voice Payments** — Say the amount in Hindi or English (e.g. "paanch sau rupaye" or "send 500"). Audio is transcribed via Google Speech Recognition, then parsed with regex (LLM fallback for Hindi number words).
 - **Merchant Trust Engine** — Every scanned UPI ID is checked against a Supabase database. Merchants are flagged as Verified, Blacklisted (payment blocked), or Unknown.
+- **Merchant Reporting** — Users who paid a merchant can report them (Scam, Wrong Amount, Fake Merchant, Other). Reports are weighted by account age and transaction history. When cumulative weighted score reaches the threshold, the merchant is auto-blacklisted.
 - **Biometric Authentication** — WebAuthn (fingerprint / FaceID) for payment confirmation. Credentials stored in Supabase.
 - **Transaction History** — View all past wallet payments with merchant names, amounts, and timestamps.
 - **Deep Links to UPI Apps** — For high-amount or insufficient-balance payments, open Google Pay, PhonePe, Paytm, or generic UPI with pre-filled details.
@@ -34,6 +35,7 @@ Secure UPI payment app with QR scanning, voice commands, in-app wallet, biometri
                               │  - wallets table       │
                               │  - transactions table  │
                               │  - merchants table     │
+                              │  - merchant_reports    │
                               │  - webauthn_credentials│
                               └───────────────────────┘
                               ┌───────────────────────┐
@@ -251,7 +253,107 @@ BEGIN
 END; $$;
 ```
 
-### 3. Existing tables
+### 3. Merchant reporting (weighted trust scoring)
+
+Run this SQL to enable the reporting system:
+
+```sql
+-- Merchant reports table
+CREATE TABLE public.merchant_reports (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  transaction_id UUID NOT NULL REFERENCES public.transactions(id),
+  upi_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  weight NUMERIC(5,2) NOT NULL DEFAULT 1.0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(user_id, upi_id)  -- one report per user per merchant
+);
+ALTER TABLE public.merchant_reports ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users read own reports"
+  ON public.merchant_reports FOR SELECT USING (auth.uid() = user_id);
+
+-- Unique constraint on merchants UPI ID
+ALTER TABLE public.merchants ADD CONSTRAINT merchants_upi_id_unique UNIQUE (upi_id);
+
+-- Atomic report submission RPC
+CREATE OR REPLACE FUNCTION public.submit_merchant_report(
+  p_user_id UUID, p_transaction_id UUID, p_upi_id TEXT, p_reason TEXT
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_weight NUMERIC(5,2) := 1.0;
+  v_account_age_days INT;
+  v_tx_count INT;
+  v_total NUMERIC;
+  v_blacklisted BOOLEAN := false;
+BEGIN
+  -- Validate transaction belongs to user and targets this UPI
+  IF NOT EXISTS (
+    SELECT 1 FROM public.transactions
+    WHERE id = p_transaction_id AND user_id = p_user_id
+      AND lower(upi_id) = lower(p_upi_id) AND direction = 'debit'
+  ) THEN
+    RAISE EXCEPTION 'Transaction not found or does not match';
+  END IF;
+
+  -- Check duplicate
+  IF EXISTS (
+    SELECT 1 FROM public.merchant_reports
+    WHERE user_id = p_user_id AND upi_id = lower(p_upi_id)
+  ) THEN
+    RAISE EXCEPTION 'Already reported this merchant';
+  END IF;
+
+  -- Cooldown: 1 hour since last report by this user
+  IF EXISTS (
+    SELECT 1 FROM public.merchant_reports
+    WHERE user_id = p_user_id AND created_at > now() - interval '1 hour'
+  ) THEN
+    RAISE EXCEPTION 'Cooldown active — wait before reporting again';
+  END IF;
+
+  -- Calculate weight
+  SELECT EXTRACT(DAY FROM now() - created_at)::INT INTO v_account_age_days
+    FROM auth.users WHERE id = p_user_id;
+  v_weight := v_weight + LEAST(v_account_age_days / 30.0, 2.0);
+
+  SELECT COUNT(*) INTO v_tx_count FROM public.transactions
+    WHERE user_id = p_user_id AND direction = 'debit';
+  v_weight := v_weight + LEAST(v_tx_count / 10.0, 2.0);
+  v_weight := LEAST(v_weight, 5.0);
+
+  -- Insert report
+  INSERT INTO public.merchant_reports (user_id, transaction_id, upi_id, reason, weight)
+    VALUES (p_user_id, p_transaction_id, lower(p_upi_id), p_reason, v_weight);
+
+  -- Sum total weighted score
+  SELECT COALESCE(SUM(weight), 0) INTO v_total
+    FROM public.merchant_reports WHERE upi_id = lower(p_upi_id);
+
+  -- Auto-blacklist if >= 10.0
+  IF v_total >= 10.0 THEN
+    INSERT INTO public.merchants (upi_id, status) VALUES (lower(p_upi_id), 'blacklisted')
+      ON CONFLICT (upi_id) DO UPDATE SET status = 'blacklisted';
+    v_blacklisted := true;
+  END IF;
+
+  RETURN jsonb_build_object('weight', v_weight, 'total_score', v_total, 'blacklisted', v_blacklisted);
+END; $$;
+```
+
+**Scoring formula:**
+
+| Factor | Formula | Range |
+|--------|---------|-------|
+| Base weight | 1.0 | 1.0 |
+| Account age | +1.0 per 30 days | 0 – 2.0 |
+| Transaction count | +1.0 per 10 debit txns | 0 – 2.0 |
+| **Max weight per report** | | **5.0** |
+| **Auto-blacklist threshold** | Sum of all weights for merchant | **≥ 10.0** |
+
+Fresh bot accounts (1 tx, 0 days) get weight ~1.1 — would need ~10 bots spending real money. A 60-day account with 20+ transactions gets weight 5.0 — only 2 such users needed.
+
+### 4. Existing tables
 
 These should already exist if you set up the app previously:
 
@@ -262,6 +364,20 @@ These should already exist if you set up the app previously:
 | `id` | int8 | Primary key, auto-increment |
 | `upi_id` | text | UPI VPA (e.g. `merchant@upi`) |
 | `status` | text | `verified`, `blacklisted`, or `unknown` |
+
+#### `merchant_reports` table
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | uuid | Primary key |
+| `user_id` | uuid | FK to auth.users |
+| `transaction_id` | uuid | FK to transactions |
+| `upi_id` | text | Merchant UPI ID (lowercased) |
+| `reason` | text | Scam, Wrong Amount, Fake Merchant, Other |
+| `weight` | numeric(5,2) | Calculated report weight (1.0 – 5.0) |
+| `created_at` | timestamptz | Report timestamp |
+
+Unique constraint: one report per (user_id, upi_id).
 
 #### `webauthn_credentials` table
 
@@ -300,6 +416,8 @@ docker run -d -p 3000:3000 -e NEXT_PUBLIC_BACKEND_URL=http://localhost:8000 ayus
 | POST | `/api/transcribe` | No | Transcribe audio (webm) to text |
 | POST | `/api/extract-amount` | No | Extract payment amount from text |
 | POST | `/api/verify-merchant` | No | Check merchant trust status |
+| POST | `/api/merchant/report` | JWT | Submit a weighted merchant report |
+| GET | `/api/merchant/report-status` | JWT | Check if user already reported a merchant |
 | GET | `/api/wallet/balance` | JWT | Get authenticated user's wallet balance |
 | POST | `/api/wallet/topup` | JWT | Add money to wallet (simulated top-up) |
 | POST | `/api/wallet/pay` | JWT | Debit wallet (≤ ₹5,000 only) |

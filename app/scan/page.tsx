@@ -36,6 +36,8 @@ interface WalletSuccessData {
   newBalance: number;
   amount: number;
   merchant: string;
+  transactionId: string;
+  upiId: string;
 }
 
 /* ── Icons ── */
@@ -260,6 +262,13 @@ export default function ScanPage() {
   const [highAmountAcknowledged, setHighAmountAcknowledged] = useState(false);
   const [biometricVerified, setBiometricVerified] = useState(false);
 
+  // Report merchant state
+  const [showReportPicker, setShowReportPicker] = useState(false);
+  const [reportSubmitting, setReportSubmitting] = useState(false);
+  const [reportDone, setReportDone] = useState<string | null>(null); // success message
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [alreadyReported, setAlreadyReported] = useState(false);
+
   // Fetch wallet balance on mount
   useEffect(() => {
     const fetchBalance = async () => {
@@ -276,6 +285,60 @@ export default function ScanPage() {
     };
     fetchBalance();
   }, [session]);
+
+  // Check if user already reported this merchant when wallet-success shows
+  useEffect(() => {
+    if (state !== "wallet-success" || !walletSuccess || !session?.access_token) return;
+    const checkReportStatus = async () => {
+      try {
+        const res = await fetch(
+          `${BACKEND}/api/merchant/report-status?upi_id=${encodeURIComponent(walletSuccess.upiId)}`,
+          { headers: { Authorization: `Bearer ${session.access_token}` } }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          setAlreadyReported(data.already_reported);
+        }
+      } catch { /* ignore */ }
+    };
+    checkReportStatus();
+  }, [state, walletSuccess, session]);
+
+  const handleReportMerchant = async (reason: string) => {
+    if (!walletSuccess || !session?.access_token) return;
+    setReportSubmitting(true);
+    setReportError(null);
+    try {
+      const res = await fetch(`${BACKEND}/api/merchant/report`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          transaction_id: walletSuccess.transactionId,
+          upi_id: walletSuccess.upiId,
+          reason,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.detail || "Report failed");
+      }
+      const data = await res.json();
+      setReportDone(
+        data.blacklisted
+          ? "Merchant has been blacklisted based on reports."
+          : "Report submitted. Thank you for keeping PaySecure safe."
+      );
+      setAlreadyReported(true);
+      setShowReportPicker(false);
+    } catch (err) {
+      setReportError(err instanceof Error ? err.message : "Report failed");
+    } finally {
+      setReportSubmitting(false);
+    }
+  };
 
   // ── Trust verification ──
 
@@ -379,6 +442,10 @@ export default function ScanPage() {
     setHighAmountAcknowledged(false);
     setBiometricVerified(false);
     setWalletSuccess(null);
+    setShowReportPicker(false);
+    setReportDone(null);
+    setReportError(null);
+    setAlreadyReported(false);
     recorder.reset();
     setState("idle");
   };
@@ -478,12 +545,14 @@ export default function ScanPage() {
         throw new Error(err?.detail || "Payment failed");
       }
 
-      const { new_balance } = await res.json();
+      const { new_balance, transaction_id } = await res.json();
       setWalletBalance(new_balance);
       setWalletSuccess({
         newBalance: new_balance,
         amount: voiceResult.amount,
         merchant: result.merchant_name,
+        transactionId: transaction_id,
+        upiId: result.upi_id,
       });
       setState("wallet-success");
     } catch (err) {
@@ -938,6 +1007,51 @@ export default function ScanPage() {
             >
               Done
             </button>
+
+            {/* Report Merchant */}
+            {reportDone ? (
+              <p className="text-xs text-emerald-600 font-medium text-center">{reportDone}</p>
+            ) : alreadyReported ? (
+              <p className="text-xs text-gray-400 text-center">You have already reported this merchant.</p>
+            ) : showReportPicker ? (
+              <div className="w-full rounded-xl bg-gray-50 border border-gray-200 p-4 animate-fadeIn">
+                <p className="text-xs font-semibold text-gray-500 mb-3 text-center">Select a reason</p>
+                {reportError && (
+                  <p className="text-xs text-red-600 mb-2 text-center">{reportError}</p>
+                )}
+                <div className="flex flex-col gap-2">
+                  {["Scam", "Wrong Amount", "Fake Merchant", "Other"].map((reason) => (
+                    <button
+                      key={reason}
+                      disabled={reportSubmitting}
+                      onClick={() => handleReportMerchant(reason)}
+                      className="w-full rounded-lg border border-gray-200 bg-white px-4 py-2.5 text-sm font-medium text-gray-700 hover:bg-red-50 hover:border-red-200 hover:text-red-700 active:scale-95 transition-all disabled:opacity-50"
+                    >
+                      {reportSubmitting ? (
+                        <span className="flex items-center justify-center gap-2">
+                          <Spinner className="h-4 w-4" /> Submitting...
+                        </span>
+                      ) : (
+                        reason
+                      )}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={() => setShowReportPicker(false)}
+                  className="w-full mt-2 text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setShowReportPicker(true)}
+                className="text-xs text-red-400 hover:text-red-600 font-medium transition-colors"
+              >
+                Report Merchant
+              </button>
+            )}
           </div>
         )}
       </div>
